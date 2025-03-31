@@ -1,0 +1,37 @@
+# Build output folders (Projucer default)
+Builds/
+build/
+
+# Visual Studio specific files
+*.vcxproj.user
+*.vcxproj.filters.*
+*.sln.docstates
+*.suo
+.vs/
+
+# VS Code specific files
+.vscode/
+
+# macOS specific files
+.DS_Store
+*.xcodeproj
+
+# Common binary/object files
+*.o
+*.obj
+*.dll
+*.exe
+*.dylib
+*.so
+*.lib
+*.a
+
+# Log files
+*.log
+
+# Backup/temporary files
+*~
+*.*~
+
+# Other common ignores
+Thumbs.db
