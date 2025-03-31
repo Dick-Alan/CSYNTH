@@ -4,6 +4,8 @@
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1">
   <MAINGROUP id="NLbn7n" name="NewProject">
     <GROUP id="{13878BAD-9351-CF10-5B93-61D89343AE67}" name="Source">
+      <FILE id="qYmxJJ" name="SynthEngine.cpp" compile="1" resource="0" file="Source/SynthEngine.cpp"/>
+      <FILE id="wfYKKW" name="SynthEngine.h" compile="0" resource="0" file="Source/SynthEngine.h"/>
       <FILE id="XJwnTt" name="ControlsComponent.h" compile="0" resource="0"
             file="Source/ControlsComponent.h"/>
       <FILE id="A4vjB1" name="ControlsComponent.cpp" compile="1" resource="0"

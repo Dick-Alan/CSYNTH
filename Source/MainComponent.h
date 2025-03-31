@@ -5,41 +5,36 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_events/juce_events.h>
 #include <juce_dsp/juce_dsp.h> // Needed for ADSR and SmoothedValue
-#include <map>                  // For std::map
-#include <atomic>               // For std::atomic
-#include <memory>               // For std::unique_ptr
-#include <JuceHeader.h>         // Includes modules selected in Projucer
+#include <map>
+#include <atomic>
+#include <memory> // Keep for std::unique_ptr if used, or remove if not
+#include <JuceHeader.h>
 
 #include "OscilloscopeComponent.h"
-#include "ControlsComponent.h" // Include full definition needed for unique_ptr member
+#include "ControlsComponent.h" // Need full definition
+#include "SynthEngine.h"       // Need full definition
 
 //==============================================================================
-/*
-    This component lives inside our window, handles audio and keyboard input,
-    and owns the child components (oscilloscope, controls).
-*/
 class MainComponent : public juce::AudioAppComponent,
     public juce::KeyListener
 {
 public:
-    // Enum to identify waveform types (IDs match ComboBox)
-    enum Waveform {
-        sine = 1,
-        square,
-        saw,
-        triangle
-    };
-
+    enum Waveform { sine = 1, square, saw, triangle };
     //==============================================================================
     MainComponent();
-    ~MainComponent() override; // Standard override for virtual destructor
+    ~MainComponent() override;
 
-    // Public method for ControlsComponent to update ADSR parameters
+    // --- Public methods for ControlsComponent callbacks ---
     void updateADSR(float attack, float decay, float sustain, float release);
+    void setWaveform(int typeId);
+    void setFineTune(float semitones);
+    void setTranspose(int semitones);
+    void updateFilter(float cutoff, float resonance); // <-- NEW
 
     //==============================================================================
     // AudioAppComponent overrides (Keep override in declaration)
-    void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override;
+    // Ensure signature matches base class EXACTLY
+    void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override; // <-- Ensure samplesPerBlockExpected is here
     void getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToFill) override;
     void releaseResources() override;
 
@@ -49,36 +44,39 @@ public:
     void resized() override;
 
     //==============================================================================
-    // KeyListener overrides (NO override in declaration, matching definition for now)
+    // KeyListener overrides (NO override in declaration for now)
     bool keyPressed(const juce::KeyPress& key, juce::Component* originatingComponent);
     bool keyStateChanged(bool isKeyDown, juce::Component* originatingComponent);
 
 
 private:
     //==============================================================================
-    // Audio Engine State
-    double currentSampleRate = 0.0; // Set in prepareToPlay
-    double currentAngle = 0.0; // Current phase for oscillator
-    double angleDelta = 0.0; // Calculated based on final frequency in audio thread
-    double targetFrequency = 0.0; // Base frequency (after transpose) set by key events
+    // State Variables MainComponent manages:
+    double currentSampleRate = 0.0;
 
-    // Synth Parameters (Thread-Safe Access where needed)
-    std::atomic<int>   currentWaveform{ Waveform::sine }; // Current waveform ID
-    juce::SmoothedValue<float> smoothedLevel{ 0.75f };    // Smoothed master volume (0.0 to 1.0)
-    std::atomic<float> fineTuneSemitones{ 0.0f };       // Fine tuning (-1 to +1 semitones)
-    std::atomic<int>   transposeSemitones{ 0 };         // Transpose (-24 to +24 semitones)
-
-    // ADSR Envelope state and parameters
-    juce::ADSR adsr;
-    juce::ADSR::Parameters adsrParams;
+    // Synth Parameters controlled by UI
+    std::atomic<int>   currentWaveform{ Waveform::sine };
+    juce::SmoothedValue<float> smoothedLevel{ 0.75f };
+    std::atomic<float> fineTuneSemitones{ 0.0f };
+    std::atomic<int>   transposeSemitones{ 0 };
+    // Filter Parameters controlled by UI
+    std::atomic<float> filterCutoffHz{ 1000.0f };   // <-- NEW (Default cutoff Hz)
+    std::atomic<float> filterResonance{ 0.707f }; // <-- NEW (Default resonance ~1/sqrt(2))
 
     // Keyboard State Tracking
-    std::map<int, bool> keysDown; // Tracks which keys *we care about* are physically down
+    std::map<int, bool> keysDown;
+    int                 currentlyPlayingNote = -1;
+
+    // Core Synthesis handled by SynthEngine
+    SynthEngine synthEngine; // Direct member
 
     // Child Components
-    OscilloscopeComponent oscilloscope; // Direct member
-    // Use unique_ptr for controlsPanel for safer memory management
-    std::unique_ptr<ControlsComponent> controlsPanel;
+    OscilloscopeComponent oscilloscope;
+    ControlsComponent controlsPanel; // Direct member
+
+    // Helper method to update engine pitch (already exists)
+    void updateEnginePitch();
+
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

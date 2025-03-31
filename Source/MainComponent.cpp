@@ -1,21 +1,19 @@
-#include "MainComponent.h" // Must be first if using precompiled headers
-#include "ControlsComponent.h"
-#include <cmath>            // For std::sin, std::pow, std::fmod, std::abs
+#include "MainComponent.h" // Includes ControlsComponent.h, SynthEngine.h implicitly now
+#include <cmath>            // For std::pow, std::fmod, std::abs, std::sin
 #include <juce_audio_utils/juce_audio_utils.h> // For MidiMessage
-#include <juce_dsp/juce_dsp.h>     // For dsp::AudioBlock etc. (Though not strictly needed for ADSR sample-by-sample)
 #include <juce_core/system/juce_TargetPlatform.h> // For DBG
+
 
 //==============================================================================
 MainComponent::MainComponent() :
-    // Use std::make_unique in initializer list to create ControlsComponent owned by unique_ptr
-    controlsPanel(std::make_unique<ControlsComponent>(this, currentWaveform, smoothedLevel, fineTuneSemitones, transposeSemitones)),
+    // Initialize controlsPanel FIRST, passing this pointer and required references
+    controlsPanel(this, currentWaveform, smoothedLevel, fineTuneSemitones, transposeSemitones, filterCutoffHz, filterResonance),
     smoothedLevel(0.75f) // Initialize SmoothedValue default level
-    // Atomics (currentWaveform, fineTuneSemitones, transposeSemitones) default initialize ok
-    // Other members (adsr, adsrParams, doubles, map) default initialize ok
+    // Other members (synthEngine, oscilloscope, atomics, map) are default constructed
 {
-    // Add and make child components visible
+    // Make child components visible AFTER they are constructed
     addAndMakeVisible(oscilloscope);
-    addAndMakeVisible(*controlsPanel); // Dereference unique_ptr to add the component
+    addAndMakeVisible(controlsPanel); // Direct member access
 
     // Keyboard setup
     setWantsKeyboardFocus(true);
@@ -24,11 +22,12 @@ MainComponent::MainComponent() :
     // Window size - ensure enough height for controls
     setSize(800, 550); // Adjust if needed
 
-    // --- Set Default ADSR Parameters (used by adsr object) ---
-    adsrParams.attack = 0.05f; // seconds
-    adsrParams.decay = 0.1f;  // seconds
-    adsrParams.sustain = 0.8f;  // level (0.0 to 1.0)
-    adsrParams.release = 0.5f;  // seconds
+    // Set Default ADSR Parameters directly in the engine via public method
+    // (Ensure default slider values in ControlsComponent match these)
+    updateADSR(0.05f, 0.1f, 0.8f, 0.5f);
+
+    // Set initial synth waveform
+    synthEngine.setWaveform(currentWaveform.load());
 
     // Initialize audio device requesting 0 inputs and 2 outputs
     setAudioChannels(0, 2);
@@ -36,34 +35,38 @@ MainComponent::MainComponent() :
 
 MainComponent::~MainComponent() // No override needed on definition
 {
-    removeKeyListener(this); // Clean up listener since we added it
+    removeKeyListener(this);
     shutdownAudio();
-    // controlsPanel unique_ptr automatically deleted here
+    // Child components (oscilloscope, controlsPanel, synthEngine) are direct members,
+    // their destructors are called automatically.
 }
 
 //==============================================================================
-void MainComponent::prepareToPlay(int /*samplesPerBlockExpected*/, double sampleRate) // No override definition
+// --- REPLACE prepareToPlay function ---
+void MainComponent::prepareToPlay(int samplesPerBlockExpected, double sampleRate) // No override definition
 {
-    currentSampleRate = sampleRate;
-    currentAngle = 0.0;
-    angleDelta = 0.0;       // Will be calculated in getNextAudioBlock
-    targetFrequency = 0.0;  // Reset frequency
-    // isNoteOn removed
+    currentSampleRate = sampleRate; // Store sample rate
 
-    // --- Initialize Level Smoother ---
-    smoothedLevel.reset(sampleRate, 0.02); // 20ms ramp time
-    smoothedLevel.setCurrentAndTargetValue(0.75f); // Set initial/target value
+    // Prepare the level smoother
+    smoothedLevel.reset(sampleRate, 0.02);
+    smoothedLevel.setCurrentAndTargetValue(0.75f); // Ensure value is set after reset
 
-    // --- Set up ADSR ---
-    adsr.setSampleRate(sampleRate); // Tell ADSR the sample rate
-    adsr.setParameters(adsrParams); // Apply the initial parameters stored in adsrParams
+    // Prepare the synth engine - Use constant '2' for numOutputChannels
+    int numOutputChannels = 2; // <<< FIXED: Use 2 directly since we called setAudioChannels(0, 2)
+    synthEngine.prepareToPlay(sampleRate, samplesPerBlockExpected, numOutputChannels);
 
-    DBG("prepareToPlay called. Sample Rate: " + juce::String(currentSampleRate)
-        + ", SmoothedLevel Target: " + juce::String(smoothedLevel.getTargetValue()));
+    // Reset note state
+    currentlyPlayingNote = -1;
+
+    // Call update methods once initially AFTER prepareToPlay
+    updateEnginePitch();
+    updateFilter(filterCutoffHz.load(), filterResonance.load());
+
+    DBG("MainComponent::prepareToPlay called. Sample Rate: " + juce::String(currentSampleRate));
 }
 
-// --- REPLACE getNextAudioBlock function ---
-// --- REPLACE getNextAudioBlock function ---
+
+
 void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToFill) // No override definition
 {
     // Get buffer pointer and number of samples
@@ -71,170 +74,164 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     auto numSamples = buffer->getNumSamples();
     auto startSample = bufferToFill.startSample;
 
-    // Check if the ADSR is completely inactive ONLY at the start.
-    if (!adsr.isActive())
+    // --- 1. Let the SynthEngine render its output (Osc -> Filter -> ADSR) ---
+    // The engine handles its own internal state checks (e.g., adsr.isActive)
+    synthEngine.renderNextBlock(*buffer, startSample, numSamples);
+
+    // --- 2. Apply the smoothed Master Level gain ---
+    // Apply gain sample-by-sample using the SmoothedValue
+    auto* leftChan = buffer->getWritePointer(0, startSample);
+    auto* rightChan = buffer->getNumChannels() > 1 ? buffer->getWritePointer(1, startSample) : nullptr;
+
+    for (int i = 0; i < numSamples; ++i)
     {
-        buffer->clear(startSample, numSamples); // Ensure silence if inactive
-        oscilloscope.copySamples(buffer->getReadPointer(0, startSample), numSamples);
-        return; // Exit early
+        float gain = smoothedLevel.getNextValue(); // Get next smoothed gain value
+        leftChan[i] *= gain; // Apply gain
+        if (rightChan != nullptr)
+            rightChan[i] *= gain;
     }
 
-    // --- If ADSR is active (Attack, Decay, Sustain, or Release phase) ---
-
-    // Calculate the angle delta based on the current targetFrequency.
-    // During release, targetFrequency still holds the frequency of the released note.
-    double currentBlockAngleDelta = 0.0;
-    if (currentSampleRate > 0.0 && targetFrequency > 0.0) // Check targetFrequency here
-    {
-        float currentFineTune = fineTuneSemitones.load();
-        double finalFrequency = targetFrequency * std::pow(2.0, currentFineTune / 12.0);
-        double cyclesPerSample = finalFrequency / currentSampleRate;
-        currentBlockAngleDelta = cyclesPerSample * 2.0 * juce::MathConstants<double>::pi;
-    }
-    // If targetFrequency is 0 (e.g., initial state), delta remains 0.
-
-    // Get buffer pointers
-    auto waveformType = currentWaveform.load();
-    auto* leftBuffer = buffer->getWritePointer(0, startSample);
-    auto* rightBuffer = buffer->getWritePointer(1, startSample);
-
-    // Process samples one by one
-    for (int sample = 0; sample < numSamples; ++sample)
-    {
-        // 1. Get the smoothed master level value for this sample
-        float currentSmoothedLevel = smoothedLevel.getNextValue();
-
-        // 2. Get the ADSR gain value for this sample (this advances the ADSR state)
-        float envelopeGain = adsr.getNextSample();
-
-        // 3. Calculate raw oscillator value
-        double currentSampleValue = 0.0;
-        // We still calculate the oscillator shape even if gain is low during release,
-        // because the phase needs to advance correctly based on the note's frequency.
-        if (currentBlockAngleDelta != 0.0)
-        {
-            double phase = std::fmod(currentAngle, 2.0 * juce::MathConstants<double>::pi) / (2.0 * juce::MathConstants<double>::pi);
-            // --- FULL Waveform Calculations ---
-            switch (waveformType)
-            {
-            case Waveform::sine:
-                currentSampleValue = std::sin(currentAngle);
-                break;
-            case Waveform::square:
-                currentSampleValue = (phase < 0.5) ? 1.0 : -1.0;
-                // TODO: Add anti-aliasing later (e.g., PolyBLEP) for better quality
-                break;
-            case Waveform::saw:
-                currentSampleValue = (2.0 * phase) - 1.0; // Ramps from -1 to +1
-                // TODO: Add anti-aliasing later
-                break;
-            case Waveform::triangle:
-                // Corrected triangle calculation: maps phase 0->0.5->1 to value -1->1->-1
-                // This version goes from 0 -> 1 -> 0 -> -1 -> 0 etc relative to phase.
-                // Let's use a simpler linear version for now:
-                currentSampleValue = 4.0 * std::abs(phase - 0.5) - 1.0; // Peaks at +/- 1
-                // TODO: Add anti-aliasing later
-                break;
-            default: // Default to sine if something goes wrong
-                currentSampleValue = std::sin(currentAngle);
-                break;
-            }
-            // --- End Waveform Calculations ---
-
-            // Increment oscillator phase angle using the calculated delta
-            currentAngle += currentBlockAngleDelta;
-        }
-        // If delta was 0, currentSampleValue remains 0.
-
-        // 4. Calculate final sample value: Osc * SmoothedLevel * ADSRGain
-        float finalSampleValue = (float)(currentSampleValue * currentSmoothedLevel * envelopeGain);
-
-        // 5. Write to output buffers
-        leftBuffer[sample] = finalSampleValue;
-        rightBuffer[sample] = finalSampleValue;
-    }
-
-    // Optional: Wrap main phase angle
-    if (currentAngle >= 2.0 * juce::MathConstants<double>::pi)
-        currentAngle -= 2.0 * juce::MathConstants<double>::pi;
-
-    // Send final output (left channel) to oscilloscope AFTER all processing
-    oscilloscope.copySamples(leftBuffer, numSamples);
+    // --- 3. Copy final result to Oscilloscope ---
+    // Get the frequency the engine is currently using
+    float currentFreq = (float)synthEngine.getCurrentFrequency();
+    oscilloscope.copySamples(leftChan, // Use the final processed left channel data
+        numSamples,
+        currentFreq); // Pass frequency to scope
 }
+void MainComponent::updateFilter(float cutoff, float resonance)
+{   
+    DBG("MainComponent::updateFilter called. Cutoff=" + juce::String(cutoff) + ", Res=" + juce::String(resonance) + ". Calling synthEngine.setFilterParameters...");
+    // Optional: Store atomic values if needed elsewhere, though engine now holds the state
+    // filterCutoffHz.store(cutoff);
+    // filterResonance.store(resonance);
 
+    // Tell the synth engine to update its internal filter parameters
+    synthEngine.setFilterParameters(cutoff, resonance);
 
+    DBG("MainComponent: Filter updated - Cutoff: " + juce::String(cutoff, 1)
+        + " Hz, Resonance: " + juce::String(resonance, 2));
+}
 void MainComponent::releaseResources() // No override definition
 {
     // Called when playback stops or audio device changes.
-    DBG("releaseResources called.");
+    DBG("MainComponent::releaseResources called.");
 }
 
-// --- Method called by ControlsComponent to update ADSR ---
+//==============================================================================
+// --- Public methods called by ControlsComponent ---
+//==============================================================================
+
 void MainComponent::updateADSR(float attack, float decay, float sustain, float release)
 {
-    // Update the parameters struct
-    adsrParams.attack = juce::jmax(0.001f, attack); // Ensure minimum time
-    adsrParams.decay = juce::jmax(0.001f, decay);
-    adsrParams.sustain = sustain; // Level 0-1
-    adsrParams.release = juce::jmax(0.001f, release);
+    // Create temporary params struct to pass to engine
+    juce::ADSR::Parameters newParams;
+    newParams.attack = juce::jmax(0.001f, attack);
+    newParams.decay = juce::jmax(0.001f, decay);
+    newParams.sustain = juce::jlimit(0.0f, 1.0f, sustain); // Clamp sustain 0-1
+    newParams.release = juce::jmax(0.001f, release);
 
-    // Apply the parameters to the ADSR object
-    adsr.setParameters(adsrParams);
+    // Tell the synth engine to update its parameters
+    synthEngine.setParameters(newParams);
 
-    DBG("MainComponent: ADSR Params Updated: A=" + juce::String(adsrParams.attack, 3)
-        + " D=" + juce::String(adsrParams.decay, 3)
-        + " S=" + juce::String(adsrParams.sustain, 2)
-        + " R=" + juce::String(adsrParams.release, 3));
+    DBG("MainComponent: ADSR Params Updated: A=" + juce::String(newParams.attack, 3)
+        + " D=" + juce::String(newParams.decay, 3)
+        + " S=" + juce::String(newParams.sustain, 2)
+        + " R=" + juce::String(newParams.release, 3));
+}
+
+void MainComponent::setWaveform(int typeId)
+{
+    currentWaveform.store(typeId); // Update our atomic state
+    synthEngine.setWaveform(typeId); // Tell the engine
+    DBG("MainComponent: Waveform set to ID: " + juce::String(typeId));
+}
+
+void MainComponent::setFineTune(float semitones)
+{
+    fineTuneSemitones.store(semitones); // Update atomic state
+    updateEnginePitch(); // Recalculate and update engine frequency
+    DBG("MainComponent: Fine Tune set to: " + juce::String(semitones));
+}
+
+void MainComponent::setTranspose(int semitones)
+{
+    transposeSemitones.store(semitones); // Update atomic state
+    updateEnginePitch(); // Recalculate and update engine frequency
+    DBG("MainComponent: Transpose set to: " + juce::String(semitones));
+}
+
+
+//==============================================================================
+// --- Private helper method ---
+//==============================================================================
+void MainComponent::updateEnginePitch()
+{
+    // This method recalculates the final frequency based on the
+    // currently held note (if any) and the latest tune/transpose values,
+    // then tells the synth engine.
+
+    if (currentlyPlayingNote != -1) // Only update if a note is actually supposed to be playing
+    {
+        int baseMidiNote = currentlyPlayingNote;
+        int currentTranspose = transposeSemitones.load();
+        float currentFineTune = fineTuneSemitones.load();
+
+        int transposedMidiNote = juce::jlimit(0, 127, baseMidiNote + currentTranspose);
+        double baseFrequency = juce::MidiMessage::getMidiNoteInHertz(transposedMidiNote);
+        double adjustedFrequency = baseFrequency * std::pow(2.0, currentFineTune / 12.0);
+
+        synthEngine.setFrequency(adjustedFrequency); // Tell engine the new frequency
+
+        DBG("MainComponent::updateEnginePitch - MIDI: " + juce::String(baseMidiNote)
+            + " -> " + juce::String(transposedMidiNote)
+            + ", Freq: " + juce::String(adjustedFrequency));
+    }
+    // If no note is playing, the engine's frequency doesn't need immediate update.
+    // It will be set correctly when the next noteOn occurs.
 }
 
 
 //==============================================================================
 // Component overrides (Definitions without override)
 //==============================================================================
+// --- REPLACE paint function ---
 void MainComponent::paint(juce::Graphics& g) // No override definition
 {
+    // Just fill the background
     g.fillAll(getLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId));
-    g.setColour(juce::Colours::white);
-    g.setFont(15.0f);
 
-    juce::String textToShow = "Click window & press keys (A,S,D...)";
-    // Display frequency only if ADSR is active (meaning note is on or releasing)
-    if (adsr.isActive())
-    {
-        float currentFineTune = fineTuneSemitones.load();
-        double displayFrequency = targetFrequency * std::pow(2.0, currentFineTune / 12.0);
-        if (displayFrequency > 0.0) {
-            textToShow = "Playing: " + juce::String(displayFrequency, 2) + " Hz";
-        }
-    }
-    g.drawText(textToShow, getLocalBounds().removeFromTop(30), juce::Justification::centred, true);
+    // Text drawing code removed
 }
 
+// --- REPLACE resized function ---
 void MainComponent::resized() // No override definition
 {
-    auto bounds = getLocalBounds();
-    auto margin = 10;
-    auto textHeight = 30;
-    bounds.removeFromTop(textHeight + margin);
+    auto bounds = getLocalBounds(); // Get the total area of MainComponent
+    auto margin = 10;               // Margin size in pixels
 
-    // Layout: Scope above controls
-    auto scopeHeight = 120;
-    auto scopeBounds = bounds.removeFromTop(scopeHeight);
-    oscilloscope.setBounds(scopeBounds.reduced(margin, 0));
+    // Remove the lines that reserved space for textHeight at the top
+    // bounds.removeFromTop(textHeight + margin); // REMOVED
 
-    bounds.removeFromTop(margin);
+    // Layout: Scope starts nearer the top now
+    auto scopeHeight = 120; // Height for the oscilloscope
+    // Use reduced bounds directly for placing first element
+    auto scopeBounds = bounds.reduced(margin, margin).removeFromTop(scopeHeight);
+    oscilloscope.setBounds(scopeBounds);
 
-    // Controls panel takes remaining space - use -> for unique_ptr
-    controlsPanel->setBounds(bounds.reduced(margin, margin));
+    // Adjust remaining bounds - remove scope height AND margin below it
+    bounds.removeFromTop(scopeHeight + margin + margin); // Remove scope + top margin + bottom margin
 
+    // Controls panel takes remaining space at the bottom
+    controlsPanel.setBounds(bounds.reduced(margin, margin)); // Reduce remaining bounds by margin
+
+    // Update DBG logs (using direct member access)
     DBG("MainComponent::resized() - Oscilloscope Bounds: " + oscilloscope.getBounds().toString());
-    DBG("MainComponent::resized() - Controls Bounds: " + controlsPanel->getBounds().toString());
+    DBG("MainComponent::resized() - Controls Bounds: " + controlsPanel.getBounds().toString());
 }
 
 
-//==============================================================================
-// KeyListener overrides (Definitions without override)
-//==============================================================================
+// --- REPLACE keyPressed function ---
+// --- REPLACE keyPressed function ---
 bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* /*originatingComponent*/) // No override definition
 {
     int keyCode = key.getKeyCode();
@@ -245,41 +242,54 @@ bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* /*ori
     }
 
     DBG("keyPressed: Key code " + juce::String(keyCode) + " (" + key.getTextDescription() + ")");
-    keysDown[keyCode] = true; // Mark as logically down NOW
 
     int baseMidiNote = -1;
-    switch (keyCode) { /* ... key mapping cases ... */
-    case 'A': baseMidiNote = 60; break; case 'W': baseMidiNote = 61; break;
-    case 'S': baseMidiNote = 62; break; case 'E': baseMidiNote = 63; break;
-    case 'D': baseMidiNote = 64; break; case 'F': baseMidiNote = 65; break;
-    case 'T': baseMidiNote = 66; break; case 'G': baseMidiNote = 67; break;
-    case 'Y': baseMidiNote = 68; break; case 'H': baseMidiNote = 69; break;
-    case 'U': baseMidiNote = 70; break; case 'J': baseMidiNote = 71; break;
-    case 'K': baseMidiNote = 72; break;
+    // --- Key Mapping Switch ---
+    switch (keyCode)
+    {
+    case 'A': baseMidiNote = 60; break; // C4
+    case 'W': baseMidiNote = 61; break; // C#4
+    case 'S': baseMidiNote = 62; break; // D4
+    case 'E': baseMidiNote = 63; break; // D#4
+    case 'D': baseMidiNote = 64; break; // E4
+    case 'F': baseMidiNote = 65; break; // F4
+    case 'T': baseMidiNote = 66; break; // F#4
+    case 'G': baseMidiNote = 67; break; // G4
+    case 'Y': baseMidiNote = 68; break; // G#4
+    case 'H': baseMidiNote = 69; break; // A4 (440 Hz)
+    case 'U': baseMidiNote = 70; break; // A#4
+    case 'J': baseMidiNote = 71; break; // B4
+    case 'K': baseMidiNote = 72; break; // C5
     default:
-        // If key isn't mapped, don't mark it as down in our map
-        keysDown.erase(keyCode);
         DBG("  Key not mapped.");
-        return false;
+        return false; // Indicate we didn't handle this key
     }
+    // --- End Key Mapping Switch ---
 
-    if (baseMidiNote > 0) {
-        // --- Calculate Target Frequency (includes Transpose) ---
-        int currentTranspose = transposeSemitones.load();
-        int transposedMidiNote = juce::jlimit(0, 127, baseMidiNote + currentTranspose);
-        targetFrequency = juce::MidiMessage::getMidiNoteInHertz(transposedMidiNote); // Store base target freq
+    // If we get here, key was mapped
+    keysDown[keyCode] = true; // Mark key as logically down NOW
 
-        // --- Trigger ADSR Note ON ---
-        // AngleDelta is calculated per-block in getNextAudioBlock now
-        adsr.noteOn(); // <<< Call noteOn() >>>
+    if (baseMidiNote > 0)
+    {
+        currentlyPlayingNote = baseMidiNote; // Store the new base note
 
-        DBG("  Key Mapped: BaseMIDI=" + juce::String(baseMidiNote)
-            + ", Transpose=" + juce::String(currentTranspose)
-            + ", FinalMIDI=" + juce::String(transposedMidiNote)
-            + ", TargetFreq=" + juce::String(targetFrequency) + ", ADSR Note ON");
+        // Calculate final pitch (including tune/transpose) and tell the engine
+        updateEnginePitch();
+
+        // Tell the engine which waveform to use
+        synthEngine.setWaveform(currentWaveform.load());
+
+        // Trigger the ADSR Note ON in the engine
+        synthEngine.noteOn();
+
+        // Log the event (using currentlyPlayingNote which holds the base MIDI)
+        DBG("  Key Mapped: BaseMIDI=" + juce::String(currentlyPlayingNote) + ", ADSR Note ON");
+
         return true; // Handled
     }
-    return false; // Should only be reached if baseMidiNote <= 0 somehow
+
+    // Should not be reached if default case handles unmapped keys properly
+    return false;
 }
 
 
@@ -293,15 +303,14 @@ bool MainComponent::keyStateChanged(bool /*isKeyDown*/, juce::Component* /*origi
     // Update internal map based on which keys *we care about* are physically down
     for (auto it = keysDown.begin(); it != keysDown.end(); ) {
         int currentKeyCode = it->first;
-        // Check the actual current state using JUCE's function
         if (juce::KeyPress::isKeyCurrentlyDown(currentKeyCode)) {
             shouldBePlaying = true;
-            it->second = true; // Ensure map state is true if key is down
+            it->second = true; // Update map state
             lastKeyDownCode = currentKeyCode; // Remember the last valid key found down
-            ++it; // Move to next element in map
+            ++it;
         }
         else {
-            // If key is UP, remove it from our map of active notes
+            // If key is UP, remove it from our map of tracked keys
             DBG("  Key Up detected in keyStateChanged: " + juce::String(currentKeyCode));
             it = keysDown.erase(it); // Erase returns iterator to the next element
         }
@@ -309,55 +318,57 @@ bool MainComponent::keyStateChanged(bool /*isKeyDown*/, juce::Component* /*origi
 
     if (shouldBePlaying) {
         // --- Handle potential note change if multiple keys were held ---
-        int baseMidiNote = -1;
-        // --- FULL Switch statement ---
-        switch (lastKeyDownCode) // Use the code of the last key confirmed down
+        int newBaseMidiNote = -1; // Find the MIDI note for the key still held down
+        // --- FULL Key Mapping Switch ---
+        switch (lastKeyDownCode)
         {
-        case 'A': baseMidiNote = 60; break; // C4
-        case 'W': baseMidiNote = 61; break; // C#4
-        case 'S': baseMidiNote = 62; break; // D4
-        case 'E': baseMidiNote = 63; break; // D#4
-        case 'D': baseMidiNote = 64; break; // E4
-        case 'F': baseMidiNote = 65; break; // F4
-        case 'T': baseMidiNote = 66; break; // F#4
-        case 'G': baseMidiNote = 67; break; // G4
-        case 'Y': baseMidiNote = 68; break; // G#4
-        case 'H': baseMidiNote = 69; break; // A4 (440 Hz)
-        case 'U': baseMidiNote = 70; break; // A#4
-        case 'J': baseMidiNote = 71; break; // B4
-        case 'K': baseMidiNote = 72; break; // C5
-            // No default needed here, if lastKeyDownCode doesn't match, baseMidiNote remains -1
+        case 'A': newBaseMidiNote = 60; break; // C4
+        case 'W': newBaseMidiNote = 61; break; // C#4
+        case 'S': newBaseMidiNote = 62; break; // D4
+        case 'E': newBaseMidiNote = 63; break; // D#4
+        case 'D': newBaseMidiNote = 64; break; // E4
+        case 'F': newBaseMidiNote = 65; break; // F4
+        case 'T': newBaseMidiNote = 66; break; // F#4
+        case 'G': newBaseMidiNote = 67; break; // G4
+        case 'Y': newBaseMidiNote = 68; break; // G#4
+        case 'H': newBaseMidiNote = 69; break; // A4 (440 Hz)
+        case 'U': newBaseMidiNote = 70; break; // A#4
+        case 'J': newBaseMidiNote = 71; break; // B4
+        case 'K': newBaseMidiNote = 72; break; // C5
+            // No default needed, if lastKeyDownCode doesn't match, newBaseMidiNote remains -1
         }
-        // --- End Switch statement ---
+        // --- End Key Mapping Switch ---
 
-        if (baseMidiNote > 0) {
-            // Calculate the frequency for the *newly remaining* key
-            int currentTranspose = transposeSemitones.load();
-            int transposedMidiNote = juce::jlimit(0, 127, baseMidiNote + currentTranspose);
-            double newTargetFrequency = juce::MidiMessage::getMidiNoteInHertz(transposedMidiNote);
-
-            // Check if the target frequency actually needs updating
-            // (using approximatelyEqual for floating point comparison)
-            if (!juce::approximatelyEqual(newTargetFrequency, targetFrequency)) {
-                targetFrequency = newTargetFrequency; // Update target freq for audio thread
-                DBG("  Note Changed/Retriggered: New TargetFreq=" + juce::String(targetFrequency));
-                // Optional: Retrigger note? adsr.noteOn();
-            }
-            // Note remains ON (ADSR state continues)
+        if (newBaseMidiNote > 0 && newBaseMidiNote != currentlyPlayingNote)
+        {
+            // A different note is now the highest priority (or only) one held down
+            currentlyPlayingNote = newBaseMidiNote; // Store the new note
+            updateEnginePitch(); // Recalculate final freq and tell engine
+            synthEngine.setWaveform(currentWaveform.load()); // Ensure waveform correct
+            // Optional: Retrigger ADSR for legato re-articulation?
+            // synthEngine.noteOn();
+            DBG("  Note Changed/Retriggered: New MIDI=" + juce::String(currentlyPlayingNote));
         }
-        else {
+        else if (newBaseMidiNote <= 0)
+        {
             // This case means the last key down wasn't mapped, but shouldBePlaying was true? Error state.
             DBG("Key state logic error: Should be playing but last key down wasn't mapped? Forcing note off.");
-            adsr.noteOff(); // Force note off
-            targetFrequency = 0.0; // Reset frequency if error
-            // angleDelta will become 0 in next getNextAudioBlock calculation
+            synthEngine.noteOff(); // Force note off
+            currentlyPlayingNote = -1; // Mark no note playing
+           
         }
+        // If the same note is still held (newBaseMidiNote == currentlyPlayingNote), do nothing - ADSR continues
     }
-    else {
+    else
+    {
         // --- All relevant keys are now released ---
-        DBG("  All relevant keys released. Triggering ADSR Note OFF.");
-        adsr.noteOff(); // <<< Trigger ADSR Release >>>
-        // DO NOT reset targetFrequency here. Let it persist for the release calculation in getNextAudioBlock.
+        if (currentlyPlayingNote != -1) // Only trigger noteOff if a note was actually playing
+        {
+            DBG("  All relevant keys released. Triggering ADSR Note OFF.");
+            synthEngine.noteOff(); // <<< Trigger ADSR Release >>>
+            currentlyPlayingNote = -1; // Mark no note as playing
+            // Keep targetFrequency as is, engine uses it until ADSR inactive
+        }
     }
     return true; // Handled state change
 }

@@ -7,26 +7,29 @@
     A simple component that draws an audio waveform.
 */
 class OscilloscopeComponent : public juce::Component,
-    public juce::Timer // Inherit from Timer for periodic updates
+    public juce::Timer
 {
 public:
     OscilloscopeComponent();
-    ~OscilloscopeComponent() override; // Standard override for virtual destructor
+    ~OscilloscopeComponent() override;
 
     // Component overrides
-    void paint(juce::Graphics&) override; // Standard override
-    void resized() override;               // Standard override
+    void paint(juce::Graphics&) override;
+    void resized() override; // Keep override in declaration
 
-    // Public method called by the audio thread to provide new samples
-    void copySamples(const float* samples, int numSamples);
+    // Update signature to accept frequency
+    void copySamples(const float* samples, int numSamples, float freqHz); // <-- MODIFIED SIGNATURE
 
 private:
     // Timer override
-    void timerCallback() override; // Standard override
+    void timerCallback() override; // Keep override in declaration
 
     juce::AudioBuffer<float> displayBuffer; // Buffer to store samples for display
-    juce::SpinLock           bufferLock;    // Lock to protect thread-safe access to displayBuffer
-    int                      bufferSize = 512; // How many samples to store/draw in the buffer
+    juce::SpinLock           bufferLock;    // Lock to protect thread-safe access
+    int                      bufferSize = 512; // Number of samples to store/draw
+
+    // Member to store the frequency for display
+    float frequencyHz = 0.0f; // <-- ADDED MEMBER
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OscilloscopeComponent)
 };

@@ -1,19 +1,24 @@
 #include "ControlsComponent.h"
-#include "MainComponent.h" // Needs to be included for calling updateADSR & accessing enum
+#include "MainComponent.h" // Needs to be included for calling MainComponent methods & enum
 #include <juce_core/system/juce_TargetPlatform.h> // For DBG
 
 //==============================================================================
-// Constructor: Takes pointer to MainComponent and references to the states it controls
+// Constructor takes pointer to MainComponent and references to the states it controls
+// --- REPLACE ControlsComponent Constructor ---
 ControlsComponent::ControlsComponent(MainComponent* mainComp,
     std::atomic<int>& waveformSelection,
     juce::SmoothedValue<float>& levelSmoother,
     std::atomic<float>& tuneSelection,
-    std::atomic<int>& transposeSelection) :
-    mainComponentPtr(mainComp), // Store pointer to parent
-    waveformSelectionRef(waveformSelection), // Initialize references
+    std::atomic<int>& transposeSelection,
+    std::atomic<float>& filterCutoff,
+    std::atomic<float>& filterResonance) :
+    mainComponentPtr(mainComp),
+    waveformSelectionRef(waveformSelection),
     levelSmootherRef(levelSmoother),
     tuneSelectionRef(tuneSelection),
-    transposeSelectionRef(transposeSelection)
+    transposeSelectionRef(transposeSelection),
+    filterCutoffRef(filterCutoff),
+    filterResonanceRef(filterResonance)
 {
     // Ensure the pointer is valid before proceeding
     jassert(mainComponentPtr != nullptr);
@@ -22,27 +27,26 @@ ControlsComponent::ControlsComponent(MainComponent* mainComp,
     waveformLabel.setText("Waveform:", juce::dontSendNotification);
     waveformLabel.attachToComponent(&waveformSelector, true);
     waveformLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(waveformLabel);
-
-    addAndMakeVisible(waveformSelector);
+    addAndMakeVisible(waveformLabel); // Make Label visible
+    addAndMakeVisible(waveformSelector); // Make ComboBox visible
     waveformSelector.setEditableText(false);
     waveformSelector.setJustificationType(juce::Justification::centred);
     waveformSelector.addItem("Sine", MainComponent::Waveform::sine);
     waveformSelector.addItem("Square", MainComponent::Waveform::square);
     waveformSelector.addItem("Sawtooth", MainComponent::Waveform::saw);
     waveformSelector.addItem("Triangle", MainComponent::Waveform::triangle);
-    waveformSelector.setSelectedId(waveformSelectionRef.load(), juce::dontSendNotification); // Set initial
+    waveformSelector.setSelectedId(waveformSelectionRef.load(), juce::dontSendNotification);
     waveformSelector.addListener(this);
 
     // --- Level Slider ---
     levelLabel.setText("Level:", juce::dontSendNotification);
     levelLabel.attachToComponent(&levelSlider, true);
     levelLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(levelLabel);
-    addAndMakeVisible(levelSlider);
+    addAndMakeVisible(levelLabel); // Make Label visible
+    addAndMakeVisible(levelSlider); // Make Slider visible
     levelSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
     levelSlider.setRange(0.0, 1.0, 0.01);
-    levelSlider.setValue(levelSmootherRef.getCurrentValue(), juce::dontSendNotification); // Use getCurrentValue for initial sync
+    levelSlider.setValue(levelSmootherRef.getCurrentValue(), juce::dontSendNotification);
     levelSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
     levelSlider.addListener(this);
 
@@ -50,40 +54,38 @@ ControlsComponent::ControlsComponent(MainComponent* mainComp,
     tuneLabel.setText("Fine Tune:", juce::dontSendNotification);
     tuneLabel.attachToComponent(&tuneSlider, true);
     tuneLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(tuneLabel);
-    addAndMakeVisible(tuneSlider);
+    addAndMakeVisible(tuneLabel); // Make Label visible
+    addAndMakeVisible(tuneSlider); // Make Slider visible
     tuneSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
-    tuneSlider.setRange(-1.0, 1.0, 0.01); // +/- 1 semitone
-    tuneSlider.setValue(tuneSelectionRef.load(), juce::dontSendNotification); // Read atomic initial
+    tuneSlider.setRange(-1.0, 1.0, 0.01);
+    tuneSlider.setValue(tuneSelectionRef.load(), juce::dontSendNotification);
     tuneSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
     tuneSlider.setNumDecimalPlacesToDisplay(2);
     tuneSlider.setTextValueSuffix(" st");
-    tuneSlider.addListener(this); // Add listener
+    tuneSlider.addListener(this);
 
     // --- Transpose Slider ---
     transposeLabel.setText("Transpose:", juce::dontSendNotification);
     transposeLabel.attachToComponent(&transposeSlider, true);
     transposeLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(transposeLabel);
-    addAndMakeVisible(transposeSlider);
+    addAndMakeVisible(transposeLabel); // Make Label visible
+    addAndMakeVisible(transposeSlider); // Make Slider visible
     transposeSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
-    transposeSlider.setRange(-24, 24, 1); // +/- 24 semitones
-    transposeSlider.setValue(transposeSelectionRef.load(), juce::dontSendNotification); // Read atomic initial
+    transposeSlider.setRange(-24, 24, 1);
+    transposeSlider.setValue(transposeSelectionRef.load(), juce::dontSendNotification);
     transposeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
     transposeSlider.setTextValueSuffix(" semi");
-    transposeSlider.addListener(this); // Add listener
+    transposeSlider.addListener(this);
 
     // --- ADSR Sliders ---
     // Attack
     attackLabel.setText("Attack:", juce::dontSendNotification);
     attackLabel.attachToComponent(&attackSlider, true);
     attackLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(attackLabel);
-    addAndMakeVisible(attackSlider);
+    addAndMakeVisible(attackLabel); // Make Label visible
+    addAndMakeVisible(attackSlider); // Make Slider visible
     attackSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
-    attackSlider.setRange(0.001, 1.0, 0.001); // Min attack > 0
-    // Get initial value from MainComponent's adsrParams if possible (requires accessor or making adsrParams public/friend)
-    // For now, set to reasonable default consistent with MainComponent constructor
+    attackSlider.setRange(0.001, 1.0, 0.001);
     attackSlider.setValue(0.05, juce::dontSendNotification); // Default Attack
     attackSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
     attackSlider.setSkewFactorFromMidPoint(0.2);
@@ -93,8 +95,8 @@ ControlsComponent::ControlsComponent(MainComponent* mainComp,
     decayLabel.setText("Decay:", juce::dontSendNotification);
     decayLabel.attachToComponent(&decaySlider, true);
     decayLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(decayLabel);
-    addAndMakeVisible(decaySlider);
+    addAndMakeVisible(decayLabel); // Make Label visible
+    addAndMakeVisible(decaySlider); // Make Slider visible
     decaySlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
     decaySlider.setRange(0.001, 1.0, 0.001);
     decaySlider.setValue(0.1, juce::dontSendNotification); // Default Decay
@@ -106,10 +108,10 @@ ControlsComponent::ControlsComponent(MainComponent* mainComp,
     sustainLabel.setText("Sustain:", juce::dontSendNotification);
     sustainLabel.attachToComponent(&sustainSlider, true);
     sustainLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(sustainLabel);
-    addAndMakeVisible(sustainSlider);
+    addAndMakeVisible(sustainLabel); // Make Label visible
+    addAndMakeVisible(sustainSlider); // Make Slider visible
     sustainSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
-    sustainSlider.setRange(0.0, 1.0, 0.01); // Level 0-1
+    sustainSlider.setRange(0.0, 1.0, 0.01);
     sustainSlider.setValue(0.8, juce::dontSendNotification); // Default Sustain
     sustainSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
     sustainSlider.addListener(this);
@@ -118,17 +120,44 @@ ControlsComponent::ControlsComponent(MainComponent* mainComp,
     releaseLabel.setText("Release:", juce::dontSendNotification);
     releaseLabel.attachToComponent(&releaseSlider, true);
     releaseLabel.setJustificationType(juce::Justification::right);
-    addAndMakeVisible(releaseLabel);
-    addAndMakeVisible(releaseSlider);
+    addAndMakeVisible(releaseLabel); // Make Label visible
+    addAndMakeVisible(releaseSlider); // Make Slider visible
     releaseSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
-    releaseSlider.setRange(0.001, 2.0, 0.001); // Allow longer release
+    releaseSlider.setRange(0.001, 2.0, 0.001);
     releaseSlider.setValue(0.5, juce::dontSendNotification); // Default Release
     releaseSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
     releaseSlider.setSkewFactorFromMidPoint(0.3);
     releaseSlider.addListener(this);
 
+    // --- Filter Controls ---
+    // Cutoff
+    filterCutoffLabel.setText("Cutoff:", juce::dontSendNotification);
+    filterCutoffLabel.attachToComponent(&filterCutoffSlider, true);
+    filterCutoffLabel.setJustificationType(juce::Justification::right);
+    addAndMakeVisible(filterCutoffLabel); // Make Label visible
+    addAndMakeVisible(filterCutoffSlider); // Make Slider visible
+    filterCutoffSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
+    filterCutoffSlider.setRange(20.0, 20000.0, 0.1);
+    filterCutoffSlider.setSkewFactorFromMidPoint(1000.0); // Logarithmic skew
+    filterCutoffSlider.setValue(filterCutoffRef.load(), juce::dontSendNotification);
+    filterCutoffSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 20);
+    filterCutoffSlider.setTextValueSuffix(" Hz");
+    filterCutoffSlider.addListener(this);
+
+    // Resonance
+    filterResonanceLabel.setText("Resonance:", juce::dontSendNotification);
+    filterResonanceLabel.attachToComponent(&filterResonanceSlider, true);
+    filterResonanceLabel.setJustificationType(juce::Justification::right);
+    addAndMakeVisible(filterResonanceLabel); // Make Label visible
+    addAndMakeVisible(filterResonanceSlider); // Make Slider visible
+    filterResonanceSlider.setSliderStyle(juce::Slider::SliderStyle::LinearHorizontal);
+    filterResonanceSlider.setRange(1.0 / std::sqrt(2.0), 18.0, 0.01); // Approx 0.707 to 18
+    filterResonanceSlider.setValue(filterResonanceRef.load(), juce::dontSendNotification);
+    filterResonanceSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
+    filterResonanceSlider.setNumDecimalPlacesToDisplay(2);
+    filterResonanceSlider.addListener(this);
+
     // Call once initially to set default ADSR params in MainComponent from slider values
-    // This assumes MainComponent::adsrParams was already initialized with these defaults too
     updateADSRParameters();
 }
 
@@ -143,6 +172,8 @@ ControlsComponent::~ControlsComponent() // No override
     decaySlider.removeListener(this);
     sustainSlider.removeListener(this);
     releaseSlider.removeListener(this);
+    filterCutoffSlider.removeListener(this);
+    filterResonanceSlider.removeListener(this);
 }
 
 void ControlsComponent::paint(juce::Graphics& g) // No override
@@ -155,13 +186,13 @@ void ControlsComponent::paint(juce::Graphics& g) // No override
 void ControlsComponent::resized() // No override
 {
     // Layout all controls vertically
-    auto bounds = getLocalBounds().reduced(10); // Add some internal margin
-    auto labelWidth = 80;    // Width for labels (e.g., "Waveform:")
-    auto controlHeight = 25; // Height for each slider/combobox row
-    auto spacing = 5;        // Vertical spacing between rows
+    auto bounds = getLocalBounds().reduced(10); // Internal margin
+    auto labelWidth = 80;    // Width for labels
+    auto controlHeight = 25; // Height for controls
+    auto spacing = 5;        // Vertical spacing
 
-    // Helper lambda to simplify laying out a control row
-    auto layoutRow = [&](juce::Component& control) {
+    // Helper lambda for laying out a row
+    auto layoutRow = [&](juce::Component& control) { // Pass Component ref
         auto rowBounds = bounds.removeFromTop(controlHeight);
         // The label is attached, so we only need to set bounds for the control itself
         control.setBounds(labelWidth, rowBounds.getY(), rowBounds.getWidth() - labelWidth, controlHeight);
@@ -177,6 +208,8 @@ void ControlsComponent::resized() // No override
     layoutRow(decaySlider);
     layoutRow(sustainSlider);
     layoutRow(releaseSlider);
+    layoutRow(filterCutoffSlider);    // Layout filter cutoff
+    layoutRow(filterResonanceSlider); // Layout filter resonance
 }
 
 // ComboBox Listener Callback
@@ -184,14 +217,21 @@ void ControlsComponent::comboBoxChanged(juce::ComboBox* comboBoxThatHasChanged) 
 {
     if (comboBoxThatHasChanged == &waveformSelector)
     {
-        waveformSelectionRef.store(waveformSelector.getSelectedId()); // Update atomic waveform ID
+        // Update the atomic variable directly
+        waveformSelectionRef.store(waveformSelector.getSelectedId());
         DBG("ControlsComponent: Waveform changed to ID: " + juce::String(waveformSelectionRef.load()));
+        // Also tell MainComponent so it can tell the engine immediately
+        if (mainComponentPtr != nullptr)
+            mainComponentPtr->setWaveform(waveformSelectionRef.load());
     }
 }
 
-// Slider Listener Callback - Handles ALL sliders now
+// Slider Listener Callback - Handles ALL sliders
 void ControlsComponent::sliderValueChanged(juce::Slider* sliderThatWasMoved) // No override
 {
+    // Ensure pointer is valid before using
+    if (mainComponentPtr == nullptr) return;
+
     if (sliderThatWasMoved == &levelSlider)
     {
         float newLevel = (float)levelSlider.getValue();
@@ -200,15 +240,15 @@ void ControlsComponent::sliderValueChanged(juce::Slider* sliderThatWasMoved) // 
     }
     else if (sliderThatWasMoved == &tuneSlider)
     {
-        float newTune = (float)tuneSlider.getValue();
-        tuneSelectionRef.store(newTune); // Update atomic value directly
-        DBG("ControlsComponent: Fine Tune changed to: " + juce::String(newTune));
+        // Call method on MainComponent to handle tune changes
+        mainComponentPtr->setFineTune((float)tuneSlider.getValue());
+        // DBG log moved to MainComponent::setFineTune
     }
     else if (sliderThatWasMoved == &transposeSlider)
     {
-        int newTranspose = (int)transposeSlider.getValue();
-        transposeSelectionRef.store(newTranspose); // Update atomic value directly
-        DBG("ControlsComponent: Transpose changed to: " + juce::String(newTranspose) + " semi");
+        // Call method on MainComponent to handle transpose changes
+        mainComponentPtr->setTranspose((int)transposeSlider.getValue());
+        // DBG log moved to MainComponent::setTranspose
     }
     // Check if any ADSR slider moved
     else if (sliderThatWasMoved == &attackSlider ||
@@ -216,7 +256,31 @@ void ControlsComponent::sliderValueChanged(juce::Slider* sliderThatWasMoved) // 
         sliderThatWasMoved == &sustainSlider ||
         sliderThatWasMoved == &releaseSlider)
     {
-        updateADSRParameters(); // Call helper function to update all ADSR params
+        updateADSRParameters(); // Call helper function to update all ADSR params via MainComponent
+    }
+    // Check if any Filter slider moved
+    else if (sliderThatWasMoved == &filterCutoffSlider ||
+        sliderThatWasMoved == &filterResonanceSlider)
+    {
+        // Read both values and call the update method on MainComponent
+        float cutoff = (float)filterCutoffSlider.getValue();
+        float res = (float)filterResonanceSlider.getValue();
+        mainComponentPtr->updateFilter(cutoff, res);
+        // DBG log moved to MainComponent::updateFilter
+    }
+    else if (sliderThatWasMoved == &filterCutoffSlider ||
+        sliderThatWasMoved == &filterResonanceSlider)
+    {
+        // Read both values
+        float cutoff = (float)filterCutoffSlider.getValue();
+        float res = (float)filterResonanceSlider.getValue();
+
+        // --- ADD THIS LOG ---
+        DBG("ControlsComponent: Filter slider moved. Read Cutoff=" + juce::String(cutoff) + ", Res=" + juce::String(res) + ". Calling updateFilter...");
+
+        // Call the update method on MainComponent (check pointer first)
+        if (mainComponentPtr != nullptr)
+            mainComponentPtr->updateFilter(cutoff, res);
     }
 }
 
