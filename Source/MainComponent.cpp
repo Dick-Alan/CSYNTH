@@ -4,32 +4,51 @@
 #include <juce_core/system/juce_TargetPlatform.h> // For DBG
 
 
-//==============================================================================
+// --- REPLACE MainComponent Constructor ---
 MainComponent::MainComponent() :
-    // Initialize controlsPanel FIRST, passing this pointer and required references
-    controlsPanel(this, currentWaveform, smoothedLevel, fineTuneSemitones, transposeSemitones, filterCutoffHz, filterResonance),
-    smoothedLevel(0.75f) // Initialize SmoothedValue default level
-    // Other members (synthEngine, oscilloscope, atomics, map) are default constructed
+    // REMOVE controlsPanel from initializer list
+    smoothedLevel(0.75f)
 {
-    // Make child components visible AFTER they are constructed
+    // --- Define Scale Patterns FIRST ---
+    scaleData.push_back({ "Major",        { 0, 2, 4, 5, 7, 9, 11 } });
+    scaleData.push_back({ "Natural Minor",{ 0, 2, 3, 5, 7, 8, 10 } });
+    scaleData.push_back({ "Dorian",       { 0, 2, 3, 5, 7, 9, 10 } });
+    // Add more scales here...
+
+    scaleNames.clear();
+    for (const auto& scaleInfo : scaleData)
+        scaleNames.add(scaleInfo.name);
+    // --- End Define Scale Patterns ---
+
+    // --- NOW Create ControlsComponent using make_unique ---
+    controlsPanel = std::make_unique<ControlsComponent>(this,
+        currentWaveform,
+        smoothedLevel,
+        fineTuneSemitones,
+        transposeSemitones,
+        filterCutoffHz,
+        filterResonance,
+        rootNote,
+        currentScaleType); // Pass all required refs
+
+    // Add and make child components visible
     addAndMakeVisible(oscilloscope);
-    addAndMakeVisible(controlsPanel); // Direct member access
+    addAndMakeVisible(*controlsPanel); // <-- Use * to dereference unique_ptr
 
     // Keyboard setup
     setWantsKeyboardFocus(true);
-    addKeyListener(this); // Workaround for key event handling
+    addKeyListener(this); // Workaround
 
-    // Window size - ensure enough height for controls
-    setSize(800, 550); // Adjust if needed
+    // Window size
+    setSize(800, 550);
 
-    // Set Default ADSR Parameters directly in the engine via public method
-    // (Ensure default slider values in ControlsComponent match these)
+    // Set Default ADSR Parameters
     updateADSR(0.05f, 0.1f, 0.8f, 0.5f);
 
     // Set initial synth waveform
     synthEngine.setWaveform(currentWaveform.load());
 
-    // Initialize audio device requesting 0 inputs and 2 outputs
+    // Initialize audio device
     setAudioChannels(0, 2);
 }
 
@@ -40,7 +59,36 @@ MainComponent::~MainComponent() // No override needed on definition
     // Child components (oscilloscope, controlsPanel, synthEngine) are direct members,
     // their destructors are called automatically.
 }
+// --- ADD THESE TWO NEW SETTERS ---
+void MainComponent::setRootNote(int rootNoteIndex) // rootNoteIndex is 0-11
+{
+    jassert(rootNoteIndex >= 0 && rootNoteIndex < 12); // Basic validation
+    if (rootNote.load() != rootNoteIndex)
+    {
+        rootNote.store(rootNoteIndex); // Store the 0-11 value
+        DBG("MainComponent: Root Note set to index: " + juce::String(rootNoteIndex)
+            + " (" + juce::MidiMessage::getMidiNoteName(rootNoteIndex, true, false, 3) + ")");
+        // Pitch of held note will update automatically via keyStateChanged check or next key press
+    }
+}
 
+void MainComponent::setScaleType(int scaleId) // scaleId is 1, 2, 3...
+{
+    // Ensure ID is valid before storing
+    if (scaleId > 0 && scaleId <= scaleData.size())
+    {
+        if (currentScaleType.load() != scaleId)
+        {
+            currentScaleType.store(scaleId); // Store the ScaleType enum value
+            DBG("MainComponent: Scale Type set to ID: " + juce::String(scaleId)
+                + " (" + scaleData[scaleId - 1].name + ")");
+            // Pitch of held note will update automatically via keyStateChanged check or next key press
+        }
+    }
+    else {
+        DBG("MainComponent: Invalid Scale Type ID received: " + juce::String(scaleId));
+    }
+}
 //==============================================================================
 // --- REPLACE prepareToPlay function ---
 void MainComponent::prepareToPlay(int samplesPerBlockExpected, double sampleRate) // No override definition
@@ -146,228 +194,254 @@ void MainComponent::setWaveform(int typeId)
     DBG("MainComponent: Waveform set to ID: " + juce::String(typeId));
 }
 
+// --- REPLACE setFineTune ---
 void MainComponent::setFineTune(float semitones)
 {
-    fineTuneSemitones.store(semitones); // Update atomic state
-    updateEnginePitch(); // Recalculate and update engine frequency
-    DBG("MainComponent: Fine Tune set to: " + juce::String(semitones));
+    if (fineTuneSemitones.exchange(semitones) != semitones) // Update atomic state, check if changed
+    {
+        updateEnginePitch(); // Recalculate and update engine frequency immediately
+        DBG("MainComponent: Fine Tune set to: " + juce::String(semitones, 2));
+    }
 }
 
+// --- REPLACE setTranspose ---
 void MainComponent::setTranspose(int semitones)
 {
-    transposeSemitones.store(semitones); // Update atomic state
-    updateEnginePitch(); // Recalculate and update engine frequency
-    DBG("MainComponent: Transpose set to: " + juce::String(semitones));
+    if (transposeSemitones.exchange(semitones) != semitones) // Update atomic state, check if changed
+    {
+        updateEnginePitch(); // Recalculate and update engine frequency immediately
+        DBG("MainComponent: Transpose set to: " + juce::String(semitones));
+    }
 }
 
 
 //==============================================================================
 // --- Private helper method ---
 //==============================================================================
+// --- ADD This Private Helper Method ---
+// --- ADD This Private Helper Method ---
 void MainComponent::updateEnginePitch()
 {
-    // This method recalculates the final frequency based on the
-    // currently held note (if any) and the latest tune/transpose values,
-    // then tells the synth engine.
+    // Recalculates final frequency based on the *currently held base MIDI note*
+    // and the latest tuning/transpose values, then tells the synth engine.
 
-    if (currentlyPlayingNote != -1) // Only update if a note is actually supposed to be playing
+    if (currentlyPlayingNote != -1 && currentSampleRate > 0.0)
     {
-        int baseMidiNote = currentlyPlayingNote;
+        int baseMidiNote = currentlyPlayingNote; // Note from scale mapping
         int currentTranspose = transposeSemitones.load();
         float currentFineTune = fineTuneSemitones.load();
 
+        // Apply transpose first
         int transposedMidiNote = juce::jlimit(0, 127, baseMidiNote + currentTranspose);
+
+        // Calculate frequency after transpose
         double baseFrequency = juce::MidiMessage::getMidiNoteInHertz(transposedMidiNote);
+
+        // Apply fine tuning
         double adjustedFrequency = baseFrequency * std::pow(2.0, currentFineTune / 12.0);
 
-        synthEngine.setFrequency(adjustedFrequency); // Tell engine the new frequency
+        // Tell the synth engine the new final frequency
+        synthEngine.setFrequency(adjustedFrequency);
 
-        DBG("MainComponent::updateEnginePitch - MIDI: " + juce::String(baseMidiNote)
-            + " -> " + juce::String(transposedMidiNote)
-            + ", Freq: " + juce::String(adjustedFrequency));
+        DBG("MainComponent::updateEnginePitch - Final Freq set: " + juce::String(adjustedFrequency, 2)
+            + " (BaseMIDI=" + juce::String(baseMidiNote) + ", Trans=" + juce::String(currentTranspose) + ", Fine=" + juce::String(currentFineTune, 2) + ")");
     }
-    // If no note is playing, the engine's frequency doesn't need immediate update.
-    // It will be set correctly when the next noteOn occurs.
+    else
+    {
+        // If no note is playing, set engine frequency to 0
+        synthEngine.setFrequency(0.0);
+        // DBG("MainComponent::updateEnginePitch - No note playing, engine frequency set to 0.");
+    }
 }
 
 
 //==============================================================================
 // Component overrides (Definitions without override)
 //==============================================================================
-// --- REPLACE paint function ---
+// --- REPLACE paint function in MainComponent.cpp ---
 void MainComponent::paint(juce::Graphics& g) // No override definition
 {
-    // Just fill the background
+    // Fill the background ONLY
     g.fillAll(getLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId));
 
-    // Text drawing code removed
+    // --- All text drawing code removed ---
 }
 
-// --- REPLACE resized function ---
+// --- REPLACE resized function in MainComponent.cpp ---
 void MainComponent::resized() // No override definition
 {
     auto bounds = getLocalBounds(); // Get the total area of MainComponent
     auto margin = 10;               // Margin size in pixels
 
-    // Remove the lines that reserved space for textHeight at the top
-    // bounds.removeFromTop(textHeight + margin); // REMOVED
+    // --- REMOVED textHeight and initial removeFromTop ---
 
-    // Layout: Scope starts nearer the top now
+    // Layout: Scope starts at the top (with margin)
     auto scopeHeight = 120; // Height for the oscilloscope
     // Use reduced bounds directly for placing first element
-    auto scopeBounds = bounds.reduced(margin, margin).removeFromTop(scopeHeight);
+    auto scopeBounds = bounds.reduced(margin).removeFromTop(scopeHeight); // Reduce by margin first
     oscilloscope.setBounds(scopeBounds);
 
     // Adjust remaining bounds - remove scope height AND margin below it
-    bounds.removeFromTop(scopeHeight + margin + margin); // Remove scope + top margin + bottom margin
+    bounds.removeFromTop(scopeBounds.getBottom() + margin); // Use scope's bottom edge + margin
 
     // Controls panel takes remaining space at the bottom
-    controlsPanel.setBounds(bounds.reduced(margin, margin)); // Reduce remaining bounds by margin
+    // Check if controlsPanel unique_ptr is valid before accessing
+    if (controlsPanel != nullptr)
+        controlsPanel->setBounds(bounds.reduced(margin)); // Reduce remaining bounds by margin
 
-    // Update DBG logs (using direct member access)
+    // Update DBG logs
     DBG("MainComponent::resized() - Oscilloscope Bounds: " + oscilloscope.getBounds().toString());
-    DBG("MainComponent::resized() - Controls Bounds: " + controlsPanel.getBounds().toString());
+    if (controlsPanel != nullptr)
+        DBG("MainComponent::resized() - Controls Bounds: " + controlsPanel->getBounds().toString());
 }
 
-
-// --- REPLACE keyPressed function ---
 // --- REPLACE keyPressed function ---
 bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* /*originatingComponent*/) // No override definition
 {
     int keyCode = key.getKeyCode();
     // Check if key is *already* logically down according to our map
     if (keysDown.count(keyCode) && keysDown[keyCode]) {
-        DBG("keyPressed: Key code " + juce::String(keyCode) + " ignored (already down).");
-        return false; // Prevent auto-repeat trigger by OS
+        // DBG("keyPressed: Key code " + juce::String(keyCode) + " ignored (already down).");
+        return false; // Prevent auto-repeat trigger
+    }
+
+    // --- Map KeyCode to an index based on defined layout ---
+    const juce::String keyOrder = "QWERTYUIOPASDFGHJKLZXCVBNM"; // 26 keys
+    int keyIndex = keyOrder.indexOfChar((juce::juce_wchar)keyCode);
+
+    if (keyIndex == -1) // Key not in our defined layout
+    {
+        // DBG("keyPressed: Key code " + juce::String(keyCode) + " (" + key.getTextDescription() + ") - Not in keyOrder map.");
+        return false;
     }
 
     DBG("keyPressed: Key code " + juce::String(keyCode) + " (" + key.getTextDescription() + ")");
 
-    int baseMidiNote = -1;
-    // --- Key Mapping Switch ---
-    switch (keyCode)
-    {
-    case 'A': baseMidiNote = 60; break; // C4
-    case 'W': baseMidiNote = 61; break; // C#4
-    case 'S': baseMidiNote = 62; break; // D4
-    case 'E': baseMidiNote = 63; break; // D#4
-    case 'D': baseMidiNote = 64; break; // E4
-    case 'F': baseMidiNote = 65; break; // F4
-    case 'T': baseMidiNote = 66; break; // F#4
-    case 'G': baseMidiNote = 67; break; // G4
-    case 'Y': baseMidiNote = 68; break; // G#4
-    case 'H': baseMidiNote = 69; break; // A4 (440 Hz)
-    case 'U': baseMidiNote = 70; break; // A#4
-    case 'J': baseMidiNote = 71; break; // B4
-    case 'K': baseMidiNote = 72; break; // C5
-    default:
-        DBG("  Key not mapped.");
-        return false; // Indicate we didn't handle this key
+    // --- Calculate MIDI Note based on Root, Scale, and Key Index ---
+    int rootNoteIndex = rootNote.load(); // 0-11 (C=0)
+    int scaleTypeId = currentScaleType.load(); // 1=Major, 2=Minor, ...
+    int scalePatternIndex = scaleTypeId - 1; // Adjust for 0-based vector index
+
+    // Ensure scale pattern exists and is valid (size 7)
+    if (scalePatternIndex < 0 || scalePatternIndex >= scaleData.size() || scaleData[scalePatternIndex].intervals.size() != 7) {
+        DBG("  Invalid scale type selected or scaleData incorrect! ScaleID=" + juce::String(scaleTypeId));
+        // Maybe flash UI or log more prominently? For now, just don't play.
+        return false; // Cannot proceed
     }
-    // --- End Key Mapping Switch ---
+    const auto& intervals = scaleData[scalePatternIndex].intervals; // Get intervals {0, 2, 4...}
 
-    // If we get here, key was mapped
-    keysDown[keyCode] = true; // Mark key as logically down NOW
+    // Calculate reference MIDI note for 'A' key (index 10) - Root Note's pitch in octave closest to Middle C (60)
+    int refMidiNote = 12 * (int)std::round((60.0 - rootNoteIndex) / 12.0) + rootNoteIndex;
+    int refKeyIndex = keyOrder.indexOfChar('A'); // Should be 10
 
-    if (baseMidiNote > 0)
-    {
-        currentlyPlayingNote = baseMidiNote; // Store the new base note
+    int offset = keyIndex - refKeyIndex; // Offset in scale steps from 'A' key
 
-        // Calculate final pitch (including tune/transpose) and tell the engine
-        updateEnginePitch();
+    // Calculate octave shift and degree index within the scale pattern
+    int octaveShift = floor((double)offset / 7.0); // How many full octaves up/down relative to 'A's octave
+    int degreeIndex = ((offset % 7) + 7) % 7; // Index within the 7 scale intervals (0-6)
 
-        // Tell the engine which waveform to use
-        synthEngine.setWaveform(currentWaveform.load());
+    // Get the interval (in semitones) from the root for this scale degree
+    int interval = intervals[degreeIndex];
 
-        // Trigger the ADSR Note ON in the engine
-        synthEngine.noteOn();
+    // Calculate the final base MIDI note number (Root's Octave + Octave Shift + Interval)
+    int finalMidiNote = refMidiNote + (octaveShift * 12) + interval; // intervals[0] is 0
 
-        // Log the event (using currentlyPlayingNote which holds the base MIDI)
-        DBG("  Key Mapped: BaseMIDI=" + juce::String(currentlyPlayingNote) + ", ADSR Note ON");
+    // Clamp to valid MIDI range
+    finalMidiNote = juce::jlimit(0, 127, finalMidiNote);
 
-        return true; // Handled
-    }
+    // --- Store state and trigger sound ---
+    keysDown[keyCode] = true; // Mark key down in our map NOW
+    currentlyPlayingNote = finalMidiNote; // Store the base MIDI note being played
 
-    // Should not be reached if default case handles unmapped keys properly
-    return false;
+    updateEnginePitch(); // Calculate final freq (incl tune/transpose) and tell engine
+    synthEngine.setWaveform(currentWaveform.load()); // Ensure waveform is set
+    synthEngine.noteOn(); // Tell engine to start ADSR
+
+    DBG("  Key Mapped: Key='" + key.getTextDescription() + "', Offset=" + juce::String(offset)
+        + ", OctShift=" + juce::String(octaveShift) + ", DegIdx=" + juce::String(degreeIndex)
+        + ", Interval=" + juce::String(interval) + ", FinalMIDI=" + juce::String(finalMidiNote)
+        + ", ADSR Note ON");
+
+    return true; // Handled
 }
 
 
 // --- REPLACE keyStateChanged function ---
+// --- REPLACE keyStateChanged function ---
 bool MainComponent::keyStateChanged(bool /*isKeyDown*/, juce::Component* /*originatingComponent*/) // No override definition
 {
-    DBG("keyStateChanged called.");
+    // DBG("keyStateChanged called."); // Keep commented unless needed for detailed debug
     bool shouldBePlaying = false;
     int lastKeyDownCode = -1;
+    int highestKeyIndex = -1; // Track index of highest priority key still down
 
-    // Update internal map based on which keys *we care about* are physically down
+    const juce::String keyOrder = "QWERTYUIOPASDFGHJKLZXCVBNM";
+
+    // Check which keys *we care about* are still physically down
     for (auto it = keysDown.begin(); it != keysDown.end(); ) {
         int currentKeyCode = it->first;
         if (juce::KeyPress::isKeyCurrentlyDown(currentKeyCode)) {
             shouldBePlaying = true;
             it->second = true; // Update map state
-            lastKeyDownCode = currentKeyCode; // Remember the last valid key found down
+            int currentKeyIndex = keyOrder.indexOfChar((juce::juce_wchar)currentKeyCode);
+            if (currentKeyIndex > highestKeyIndex) { // Track the highest index found
+                highestKeyIndex = currentKeyIndex;
+                lastKeyDownCode = currentKeyCode; // Store the code of the highest key
+            }
             ++it;
         }
         else {
             // If key is UP, remove it from our map of tracked keys
-            DBG("  Key Up detected in keyStateChanged: " + juce::String(currentKeyCode));
+             // DBG("  Key Up detected in keyStateChanged: " + juce::String(currentKeyCode));
             it = keysDown.erase(it); // Erase returns iterator to the next element
         }
     }
 
     if (shouldBePlaying) {
         // --- Handle potential note change if multiple keys were held ---
-        int newBaseMidiNote = -1; // Find the MIDI note for the key still held down
-        // --- FULL Key Mapping Switch ---
-        switch (lastKeyDownCode)
-        {
-        case 'A': newBaseMidiNote = 60; break; // C4
-        case 'W': newBaseMidiNote = 61; break; // C#4
-        case 'S': newBaseMidiNote = 62; break; // D4
-        case 'E': newBaseMidiNote = 63; break; // D#4
-        case 'D': newBaseMidiNote = 64; break; // E4
-        case 'F': newBaseMidiNote = 65; break; // F4
-        case 'T': newBaseMidiNote = 66; break; // F#4
-        case 'G': newBaseMidiNote = 67; break; // G4
-        case 'Y': newBaseMidiNote = 68; break; // G#4
-        case 'H': newBaseMidiNote = 69; break; // A4 (440 Hz)
-        case 'U': newBaseMidiNote = 70; break; // A#4
-        case 'J': newBaseMidiNote = 71; break; // B4
-        case 'K': newBaseMidiNote = 72; break; // C5
-            // No default needed, if lastKeyDownCode doesn't match, newBaseMidiNote remains -1
-        }
-        // --- End Key Mapping Switch ---
+        int rootNoteIndex = rootNote.load();
+        int scaleTypeId = currentScaleType.load();
+        int scalePatternIndex = juce::jlimit(0, (int)scaleData.size() - 1, scaleTypeId - 1);
 
-        if (newBaseMidiNote > 0 && newBaseMidiNote != currentlyPlayingNote)
-        {
-            // A different note is now the highest priority (or only) one held down
-            currentlyPlayingNote = newBaseMidiNote; // Store the new note
+        // Safety check scale data
+        if (scaleData.empty() || scalePatternIndex >= scaleData.size() || scaleData[scalePatternIndex].intervals.size() != 7) {
+            DBG("  keyStateChanged: Invalid scale data! Forcing note off.");
+            if (currentlyPlayingNote != -1) {
+                synthEngine.noteOff();
+                currentlyPlayingNote = -1;
+                updateEnginePitch(); // Tell engine freq is 0
+            }
+            return true;
+        }
+        const auto& intervals = scaleData[scalePatternIndex].intervals;
+        int refMidiNote = 12 * (int)std::round((60.0 - rootNoteIndex) / 12.0) + rootNoteIndex;
+        int refKeyIndex = keyOrder.indexOfChar('A');
+        int offset = highestKeyIndex - refKeyIndex;
+        int octaveShift = floor((double)offset / 7.0);
+        int degreeIndex = ((offset % 7) + 7) % 7;
+        int interval = intervals[degreeIndex];
+        int newMidiNote = juce::jlimit(0, 127, refMidiNote + (octaveShift * 12) + interval);
+
+        // Check if the highest sounding note has changed
+        if (newMidiNote != currentlyPlayingNote) {
+            currentlyPlayingNote = newMidiNote; // Store the new note
             updateEnginePitch(); // Recalculate final freq and tell engine
             synthEngine.setWaveform(currentWaveform.load()); // Ensure waveform correct
-            // Optional: Retrigger ADSR for legato re-articulation?
+            // Optional: Retrigger ADSR? Let's keep legato feel for now.
             // synthEngine.noteOn();
             DBG("  Note Changed/Retriggered: New MIDI=" + juce::String(currentlyPlayingNote));
         }
-        else if (newBaseMidiNote <= 0)
-        {
-            // This case means the last key down wasn't mapped, but shouldBePlaying was true? Error state.
-            DBG("Key state logic error: Should be playing but last key down wasn't mapped? Forcing note off.");
-            synthEngine.noteOff(); // Force note off
-            currentlyPlayingNote = -1; // Mark no note playing
-           
-        }
-        // If the same note is still held (newBaseMidiNote == currentlyPlayingNote), do nothing - ADSR continues
+        // If the same note is still held, do nothing - ADSR continues
     }
-    else
+    else // --- All relevant keys are now released ---
     {
-        // --- All relevant keys are now released ---
         if (currentlyPlayingNote != -1) // Only trigger noteOff if a note was actually playing
         {
             DBG("  All relevant keys released. Triggering ADSR Note OFF.");
             synthEngine.noteOff(); // <<< Trigger ADSR Release >>>
             currentlyPlayingNote = -1; // Mark no note as playing
-            // Keep targetFrequency as is, engine uses it until ADSR inactive
+            // --- REMOVED resetting targetFrequency and angleDelta here ---
+            // updateEnginePitch(); // Call this to tell engine frequency is now 0
         }
     }
     return true; // Handled state change

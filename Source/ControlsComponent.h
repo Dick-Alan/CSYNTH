@@ -16,23 +16,26 @@ class ControlsComponent : public juce::Component,
     public juce::Slider::Listener
 {
 public:
-    // Constructor takes pointer to MainComponent and references to states it controls
+    // Constructor takes pointer to MainComponent and references to ALL states it controls
     ControlsComponent(MainComponent* mainComp,
         std::atomic<int>& waveformSelection,
         juce::SmoothedValue<float>& levelSmoother,
         std::atomic<float>& tuneSelection,
         std::atomic<int>& transposeSelection,
-        std::atomic<float>& filterCutoff,    // <-- NEW Ref
-        std::atomic<float>& filterResonance);// <-- NEW Ref
-    ~ControlsComponent() override;
+        std::atomic<float>& filterCutoff,
+        std::atomic<float>& filterResonance,
+        std::atomic<int>& rootNoteSelection,      // <-- NEW Ref
+        std::atomic<int>& scaleTypeSelection);    // <-- NEW Ref
+
+    ~ControlsComponent() override; // Keep standard override
 
     // Component overrides
-    void paint(juce::Graphics&) override;
-    void resized() override;
+    void paint(juce::Graphics&) override; // Keep override in declaration
+    void resized() override;               // Keep override in declaration
 
     // Listener Callbacks
-    void comboBoxChanged(juce::ComboBox* comboBoxThatHasChanged) override;
-    void sliderValueChanged(juce::Slider* sliderThatWasMoved) override;
+    void comboBoxChanged(juce::ComboBox* comboBoxThatHasChanged) override; // Keep override here
+    void sliderValueChanged(juce::Slider* sliderThatWasMoved) override;   // Keep override here
 
 private:
     // UI Elements
@@ -58,26 +61,34 @@ private:
     juce::Label releaseLabel;
     juce::Slider releaseSlider;
 
-    // --- Filter Controls ---
-    juce::Label filterCutoffLabel;      // <-- NEW
-    juce::Slider filterCutoffSlider;    // <-- NEW
-    juce::Label filterResonanceLabel;   // <-- NEW
-    juce::Slider filterResonanceSlider; // <-- NEW
+    // Filter Controls
+    juce::Label filterCutoffLabel;
+    juce::Slider filterCutoffSlider;
+    juce::Label filterResonanceLabel;
+    juce::Slider filterResonanceSlider;
 
-    // Pointer back to MainComponent
+    // --- Scale Controls ---
+    juce::Label rootNoteLabel;          // <-- NEW Declaration
+    juce::ComboBox rootNoteSelector;    // <-- NEW Declaration
+    juce::Label scaleTypeLabel;         // <-- NEW Declaration
+    juce::ComboBox scaleTypeSelector;   // <-- NEW Declaration
+
+
+    // Pointer back to MainComponent (used for updateADSR)
     MainComponent* mainComponentPtr;
 
-    // References to state in MainComponent
+    // References to state in MainComponent that this component directly updates/reads
     std::atomic<int>& waveformSelectionRef;
     juce::SmoothedValue<float>& levelSmootherRef;
     std::atomic<float>& tuneSelectionRef;
     std::atomic<int>& transposeSelectionRef;
-    std::atomic<float>& filterCutoffRef;      // <-- NEW Ref
-    std::atomic<float>& filterResonanceRef;   // <-- NEW Ref
+    std::atomic<float>& filterCutoffRef;
+    std::atomic<float>& filterResonanceRef;
+    std::atomic<int>& rootNoteRef;          // <-- NEW Ref Member
+    std::atomic<int>& scaleTypeRef;         // <-- NEW Ref Member
 
-    // Helper function to trigger update in MainComponent
+    // Helper function to trigger update in MainComponent for ADSR
     void updateADSRParameters();
-    // No specific helper needed for filter, sliderValueChanged will call MainComponent directly
 
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ControlsComponent)
